@@ -1,0 +1,804 @@
+//@version=6
+indicator("XAU Momentum Sweep v7", shorttitle="XAU Mom v7", overlay=true, max_boxes_count=100, max_lines_count=500, max_labels_count=500)
+
+// ════════════════════════════════════════════════════════════
+//  XAUUSD • M3 / M5 / M15
+//  Dua mesin sinyal tanpa batas jumlah sinyal:
+//   [SMC] Sweep -> MSS/CISD -> retrace Fib OTE -> rejection
+//   [MOM] Momentum displacement + harga masih wajar (anti kejar)
+//
+//  v7: setup yang SELESAI (SL / BE / TP3 / timeout) otomatis dihapus dari chart &
+//   dashboard, lalu sinyal baru bisa muncul. Default momentum dilonggarkan +
+//   ada FUNNEL diagnostik di dashboard (di tahap mana sinyal tersaring).
+//  v6: SETIAP sinyal dilacak sendiri sampai selesai (bisa banyak sekaligus).
+//   - Tanda di chart saat TP1 / TP2 / TP3 / SL / BE tercapai.
+//   - Dashboard: jumlah TP1/TP2/TP3/SL/BE per mesin, persentase, net R,
+//     dan riwayat hasil terakhir.
+//   - Manajemen trailing (opsional): SL ke entry setelah TP1,
+//     SL ke TP1 setelah TP2.
+// ════════════════════════════════════════════════════════════
+
+// ───────────── INPUT ─────────────
+mode = input.string("Seimbang", "Mode Sinyal", options=["Agresif", "Seimbang", "Ketat"], group="Mode", tooltip="Agresif = tanpa filter HTF & killzone (sinyal terbanyak). Seimbang = filter bias HTF saja. Ketat = filter HTF + killzone, SMC wajib konfluensi FVG dan zona Fib 0.618-0.786.")
+
+htfIn  = input.string("Auto", "Timeframe Bias (HTF)", options=["Auto", "15", "60", "240", "D"], group="Bias", tooltip="Auto: M3/M5 pakai H1, M15 pakai H4.")
+htfLen = input.int(50, "EMA Bias HTF", minval=5, group="Bias")
+
+momOn      = input.bool(true, "Aktifkan sinyal Momentum", group="Momentum")
+momBody    = input.float(0.7, "Body candle minimum (x ATR)", minval=0.3, step=0.1, group="Momentum")
+momStretch = input.float(2.5, "Maks jarak harga dari EMA21 (x ATR) - anti kejar", minval=0.5, step=0.1, group="Momentum")
+momMaxRisk = input.float(2.5, "Risiko maksimum momentum (x ATR)", minval=0.8, step=0.1, group="Momentum")
+momSlBuf   = input.float(0.2, "SL buffer momentum (x ATR)", step=0.05, group="Momentum")
+useVol     = input.bool(false, "Wajib volume di atas rata-rata (tick volume forex kurang andal)", group="Momentum")
+volMult    = input.float(1.0, "Volume > SMA20 x", minval=0.3, step=0.1, group="Momentum")
+mr1        = input.float(1.0, "TP1 momentum (R)", step=0.1, group="Momentum")
+mr2        = input.float(2.0, "TP2 momentum (R)", step=0.1, group="Momentum")
+mr3        = input.float(3.0, "TP3 momentum (R)", step=0.1, group="Momentum")
+
+swLen      = input.int(5, "Swing Struktur (BOS/CHoCH)", minval=2, maxval=20, group="Struktur")
+extLen     = input.int(10, "Swing Likuiditas (high/low eksternal)", minval=3, maxval=40, group="Struktur")
+showStruct = input.bool(true, "Tampilkan BOS / CHoCH", group="Struktur")
+
+useAsia   = input.bool(true, "Asia High/Low sebagai likuiditas", group="Likuiditas")
+asiaSess  = input.session("0700-1300", "Sesi Asia (waktu lokal)", group="Likuiditas")
+minWick   = input.float(0.1, "Kedalaman sweep minimum (x ATR)", minval=0.0, step=0.05, group="Likuiditas")
+showSweep = input.bool(true, "Tampilkan penanda sweep", group="Likuiditas")
+showPdh   = input.bool(true, "Garis PDH / PDL", group="Likuiditas")
+
+mssLook = input.int(5, "MSS: level = high/low N bar sebelum sweep", minval=2, group="Setup SMC")
+mssWait = input.int(20, "Maks bar menunggu MSS setelah sweep", minval=3, group="Setup SMC")
+retWait = input.int(20, "Maks bar menunggu retrace setelah MSS", minval=3, group="Setup SMC")
+minLeg  = input.float(1.0, "Panjang impuls minimum (x ATR)", minval=0.2, step=0.1, group="Setup SMC")
+useCisd = input.bool(true, "CISD dihitung sebagai konfirmasi MSS", group="Setup SMC")
+fib2    = input.float(0.786, "Fib zona bawah (OTE)", minval=0.6, maxval=0.95, step=0.01, group="Setup SMC")
+fibKill = input.float(0.886, "Batalkan setup jika close melewati Fib", minval=0.7, maxval=1.0, step=0.01, group="Setup SMC")
+
+slBuf   = input.float(0.3, "SL buffer di luar ekstrem sweep (x ATR)", step=0.05, group="Risiko SMC")
+minRisk = input.float(0.5, "Risiko minimum (x ATR)", step=0.1, group="Risiko SMC")
+maxRisk = input.float(5.0, "Risiko maksimum SMC (x ATR)", step=0.1, group="Risiko SMC")
+ext1    = input.float(0.0, "TP1: ekstensi Fib (0 = ujung impuls)", step=0.1, group="Risiko SMC")
+ext2    = input.float(0.272, "TP2: ekstensi Fib (0.272 = 1.272)", step=0.1, group="Risiko SMC")
+ext3    = input.float(0.618, "TP3: ekstensi Fib (0.618 = 1.618)", step=0.1, group="Risiko SMC")
+
+showHits = input.bool(true, "Tampilkan tanda TP / SL di chart", group="Hasil")
+useBE    = input.bool(true, "Trailing: SL ke entry setelah TP1, ke TP1 setelah TP2", group="Hasil")
+maxHold  = input.int(200, "Batas umur pelacakan sinyal (bar)", minval=20, group="Hasil", tooltip="Sinyal yang belum kena TP/SL setelah N bar dianggap timeout.")
+dashFull = input.bool(true, "Dashboard lengkap (matikan untuk ringkas)", group="Hasil")
+
+cooldown = input.int(3, "Jeda antar sinyal (bar, 0 = tanpa jeda)", minval=0, group="Umum")
+pipSize  = input.float(0.1, "Ukuran 1 pip emas", step=0.01, group="Umum")
+
+showFvg = input.bool(true, "Tampilkan FVG", group="FVG")
+fvgMin  = input.float(0.25, "Min ukuran FVG (x ATR)", minval=0.0, step=0.05, group="FVG")
+maxFvg  = input.int(6, "Maks FVG aktif", minval=1, maxval=30, group="FVG")
+
+tz         = input.string("Asia/Jakarta", "Zona waktu", group="Sesi")
+londonSess = input.session("1400-1800", "London Killzone", group="Sesi")
+nySess     = input.session("1900-2300", "New York Killzone", group="Sesi")
+showKz     = input.bool(false, "Shading killzone", group="Sesi")
+
+showPat  = input.bool(true, "Tampilkan pola candle di zona OTE", group="Tampilan")
+showDash = input.bool(true, "Dashboard", group="Tampilan")
+dashPos  = input.string("Top Right", "Posisi dashboard", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group="Tampilan")
+colBull  = input.color(#00bfa5, "Warna Bullish / TP", group="Tampilan")
+colBear  = input.color(#ff5252, "Warna Bearish / SL", group="Tampilan")
+
+// ───────────── PRESET MODE ─────────────
+useHtf  = mode != "Agresif"
+useKz   = mode == "Ketat"
+needFvg = mode == "Ketat"
+needRej = mode != "Agresif"
+fib1    = mode == "Agresif" ? 0.382 : mode == "Seimbang" ? 0.5 : 0.618
+minRR   = mode == "Agresif" ? 0.8 : mode == "Seimbang" ? 1.2 : 1.6
+
+// ───────────── DASAR ─────────────
+conf = barstate.isconfirmed
+atr  = ta.atr(14)
+bd   = math.abs(close - open)
+rng  = high - low
+upW  = high - math.max(open, close)
+loW  = math.min(open, close) - low
+tfSec = timeframe.in_seconds()
+tfOk  = tfSec >= 180 and tfSec <= 900
+hhPrev = ta.highest(high, mssLook)[1]
+llPrev = ta.lowest(low, mssLook)[1]
+
+// ───────────── SESI ─────────────
+inLon  = not na(time(timeframe.period, londonSess, tz))
+inNy   = not na(time(timeframe.period, nySess, tz))
+inKz   = inLon or inNy
+inAsia = not na(time(timeframe.period, asiaSess, tz))
+bgcolor(showKz and inKz ? color.new(color.blue, 94) : na)
+
+// ───────────── RANGE ASIA ─────────────
+var float asiaHi = na
+var float asiaLo = na
+var float asiaHiL = na
+var float asiaLoL = na
+if inAsia and not inAsia[1]
+    asiaHi := high
+    asiaLo := low
+else if inAsia
+    asiaHi := math.max(asiaHi, high)
+    asiaLo := math.min(asiaLo, low)
+if not inAsia and inAsia[1]
+    asiaHiL := asiaHi
+    asiaLoL := asiaLo
+plot(useAsia ? asiaHiL : na, "Asia High", color=color.new(color.orange, 55), linewidth=1, style=plot.style_linebr)
+plot(useAsia ? asiaLoL : na, "Asia Low", color=color.new(color.orange, 55), linewidth=1, style=plot.style_linebr)
+
+// ───────────── BIAS HTF (tidak repaint) ─────────────
+htf = htfIn == "Auto" ? (tfSec <= 300 ? "60" : "240") : htfIn
+[htfC, htfE, htfE4] = request.security(syminfo.tickerid, htf, [close[1], ta.ema(close, htfLen)[1], ta.ema(close, htfLen)[4]], lookahead=barmerge.lookahead_on)
+htfBull = htfC > htfE and htfE > htfE4
+htfBear = htfC < htfE and htfE < htfE4
+
+// ───────────── PDH / PDL ─────────────
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+plot(showPdh ? pdh : na, "PDH", color=color.new(color.gray, 45), linewidth=1, style=plot.style_linebr)
+plot(showPdh ? pdl : na, "PDL", color=color.new(color.gray, 45), linewidth=1, style=plot.style_linebr)
+
+// ───────────── SWING EKSTERNAL (likuiditas) ─────────────
+phE = ta.pivothigh(high, extLen, extLen)
+plE = ta.pivotlow(low, extLen, extLen)
+var float extH = na
+var float extL = na
+if not na(phE)
+    extH := phE
+if not na(plE)
+    extL := plE
+
+// ───────────── STRUKTUR (BOS / CHoCH) ─────────────
+ph = ta.pivothigh(high, swLen, swLen)
+pl = ta.pivotlow(low, swLen, swLen)
+
+var float swHigh = na
+var float swLow = na
+var int swHighBar = na
+var int swLowBar = na
+var bool highBroken = true
+var bool lowBroken = true
+var int trend = 0
+
+if not na(ph)
+    swHigh := ph
+    swHighBar := bar_index - swLen
+    highBroken := false
+if not na(pl)
+    swLow := pl
+    swLowBar := bar_index - swLen
+    lowBroken := false
+
+bullBreak = not na(swHigh) and not highBroken and close > swHigh
+bearBreak = not na(swLow) and not lowBroken and close < swLow
+
+if bullBreak
+    if conf and showStruct
+        line.new(swHighBar, swHigh, bar_index, swHigh, color=color.new(colBull, 35), style=line.style_dashed, width=1)
+        label.new(int((swHighBar + bar_index) / 2), swHigh + atr * 0.2, trend == -1 ? "CHoCH" : "BOS", style=label.style_none, textcolor=colBull, size=size.tiny)
+    highBroken := true
+    trend := 1
+else if bearBreak
+    if conf and showStruct
+        line.new(swLowBar, swLow, bar_index, swLow, color=color.new(colBear, 35), style=line.style_dashed, width=1)
+        label.new(int((swLowBar + bar_index) / 2), swLow - atr * 0.2, trend == 1 ? "CHoCH" : "BOS", style=label.style_none, textcolor=colBear, size=size.tiny)
+    lowBroken := true
+    trend := -1
+
+// ───────────── CISD ─────────────
+bearRunStart = close < open and not (close[1] < open[1])
+bullRunStart = close > open and not (close[1] > open[1])
+
+var float bearOpen = na
+var float bullOpen = na
+var int delivery = 0
+
+if bearRunStart
+    bearOpen := open
+if bullRunStart
+    bullOpen := open
+if delivery == 0
+    delivery := close >= open ? 1 : -1
+
+cisdBull = delivery == -1 and not na(bearOpen) and close > bearOpen and bd >= atr * 0.3
+cisdBear = delivery == 1 and not na(bullOpen) and close < bullOpen and bd >= atr * 0.3
+
+if cisdBull
+    delivery := 1
+else if cisdBear
+    delivery := -1
+
+// ───────────── FAIR VALUE GAP ─────────────
+var array<box> fvgBox = array.new<box>()
+var array<float> fvgTop = array.new<float>()
+var array<float> fvgBot = array.new<float>()
+var array<int> fvgDir = array.new<int>()
+
+if array.size(fvgBox) > 0
+    for i = array.size(fvgBox) - 1 to 0
+        zt = array.get(fvgTop, i)
+        zb = array.get(fvgBot, i)
+        zd = array.get(fvgDir, i)
+        zx = array.get(fvgBox, i)
+        mitigated = (zd == 1 and close < zb) or (zd == -1 and close > zt)
+        if conf
+            if mitigated
+                box.delete(zx)
+                array.remove(fvgBox, i)
+                array.remove(fvgTop, i)
+                array.remove(fvgBot, i)
+                array.remove(fvgDir, i)
+            else
+                box.set_right(zx, bar_index)
+
+bullFvg = low > high[2] and (low - high[2]) >= atr * fvgMin and close[1] > open[1]
+bearFvg = high < low[2] and (low[2] - high) >= atr * fvgMin and close[1] < open[1]
+
+if conf and bullFvg
+    array.push(fvgBox, box.new(bar_index - 2, low, bar_index, high[2], border_color=na, bgcolor=color.new(colBull, showFvg ? 85 : 100)))
+    array.push(fvgTop, low)
+    array.push(fvgBot, high[2])
+    array.push(fvgDir, 1)
+else if conf and bearFvg
+    array.push(fvgBox, box.new(bar_index - 2, low[2], bar_index, high, border_color=na, bgcolor=color.new(colBear, showFvg ? 85 : 100)))
+    array.push(fvgTop, low[2])
+    array.push(fvgBot, high)
+    array.push(fvgDir, -1)
+
+if conf and array.size(fvgBox) > maxFvg
+    box.delete(array.shift(fvgBox))
+    array.shift(fvgTop)
+    array.shift(fvgBot)
+    array.shift(fvgDir)
+
+// ───────────── POLA CANDLE ─────────────
+bullEngulf = close[1] < open[1] and close > open and close >= open[1] and open <= close[1] and bd > bd[1]
+bearEngulf = close[1] > open[1] and close < open and close <= open[1] and open >= close[1] and bd > bd[1]
+bullPin = rng > atr * 0.5 and loW >= rng * 0.6 and upW <= rng * 0.2
+bearPin = rng > atr * 0.5 and upW >= rng * 0.6 and loW <= rng * 0.2
+patBull = bullEngulf or bullPin
+patBear = bearEngulf or bearPin
+
+// ════════════════════════════════════════════════════════════
+//  [SMC] 1) DETEKSI SWEEP LIKUIDITAS
+// ════════════════════════════════════════════════════════════
+wickMin = atr * minWick
+
+ssAsia = useAsia and not na(asiaLoL) and low <= asiaLoL - wickMin and close > asiaLoL
+ssPdl  = not na(pdl) and low <= pdl - wickMin and close > pdl
+ssExt  = not na(extL) and low <= extL - wickMin and close > extL
+ssHit  = ssAsia or ssPdl or ssExt
+ssLvl  = ssAsia ? asiaLoL : ssPdl ? pdl : ssExt ? extL : na
+
+bsAsia = useAsia and not na(asiaHiL) and high >= asiaHiL + wickMin and close < asiaHiL
+bsPdh  = not na(pdh) and high >= pdh + wickMin and close < pdh
+bsExt  = not na(extH) and high >= extH + wickMin and close < extH
+bsHit  = bsAsia or bsPdh or bsExt
+bsLvl  = bsAsia ? asiaHiL : bsPdh ? pdh : bsExt ? extH : na
+
+armDir = ssHit and bsHit ? (close >= open ? 1 : -1) : ssHit ? 1 : bsHit ? -1 : 0
+armLvl = armDir == 1 ? ssLvl : armDir == -1 ? bsLvl : na
+armTyp = armDir == 1 ? (ssAsia ? "Asia" : ssPdl ? "PDL" : "Swing") : (bsAsia ? "Asia" : bsPdh ? "PDH" : "Swing")
+
+// ════════════════════════════════════════════════════════════
+//  [SMC] 2) STATE MACHINE: 0 idle, 1 sweep (tunggu MSS), 2 MSS (tunggu retrace OTE)
+// ════════════════════════════════════════════════════════════
+var int st = 0
+var int sd = 0
+var float sLvl = na
+var float sExt = na
+var float sMss = na
+var float sLeg = na
+var int sBar = na
+var int mBar = na
+var int lastSig = na
+var int dayCount = 0
+var int lastDayKey = na
+var string lastSweepTxt = "-"
+
+bool newSweep = false
+bool newSt2 = false
+bool resetSt = false
+bool mssByCisd = false
+
+dayKey = year * 10000 + month * 100 + dayofmonth
+if na(lastDayKey) or dayKey != lastDayKey
+    dayCount := 0
+    lastDayKey := dayKey
+
+if st == 1
+    if (sd == 1 and close < sLvl) or (sd == -1 and close > sLvl) or (bar_index - sBar > mssWait)
+        st := 0
+        resetSt := true
+else if st == 2
+    if (sd == 1 and low < sExt) or (sd == -1 and high > sExt) or (bar_index - mBar > retWait)
+        st := 0
+        resetSt := true
+
+if armDir != 0 and (st == 0 or st == 1)
+    st := 1
+    sd := armDir
+    sLvl := armLvl
+    sExt := armDir == 1 ? low : high
+    sBar := bar_index
+    sMss := armDir == 1 ? hhPrev : llPrev
+    newSweep := true
+else if st == 1
+    sExt := sd == 1 ? math.min(sExt, low) : math.max(sExt, high)
+    legNow = sd == 1 ? high : low
+    mssPrice = sd == 1 ? close > sMss : close < sMss
+    mssCis = useCisd and (sd == 1 ? cisdBull : cisdBear)
+    legSzNow = sd * (legNow - sExt)
+    if (mssPrice or mssCis) and legSzNow >= minLeg * atr
+        st := 2
+        mBar := bar_index
+        sLeg := legNow
+        newSt2 := true
+        mssByCisd := not mssPrice
+else if st == 2
+    sLeg := sd == 1 ? math.max(sLeg, high) : math.min(sLeg, low)
+
+// ───────────── ZONA FIBONACCI OTE ─────────────
+legSz = sd * (sLeg - sExt)
+zTop  = sLeg - sd * legSz * fib1
+zBot  = sLeg - sd * legSz * fib2
+zKill = sLeg - sd * legSz * fibKill
+zMid  = sLeg - sd * legSz * ((fib1 + fib2) / 2)
+
+if st == 2 and ((sd == 1 and close < zKill) or (sd == -1 and close > zKill))
+    st := 0
+    resetSt := true
+
+bool fvgOv = false
+if st == 2 and array.size(fvgBox) > 0
+    for i = 0 to array.size(fvgBox) - 1
+        if array.get(fvgDir, i) == sd
+            ft = array.get(fvgTop, i)
+            fb = array.get(fvgBot, i)
+            if fb <= math.max(zTop, zBot) and ft >= math.min(zTop, zBot)
+                fvgOv := true
+
+// ───────────── [SMC] EVALUASI ENTRY ─────────────
+entryP = close
+slP    = sExt - sd * atr * slBuf
+riskP  = math.abs(entryP - slP)
+tp1P   = sLeg + sd * legSz * ext1
+tp2P   = sLeg + sd * legSz * ext2
+tp3P   = sLeg + sd * legSz * ext3
+rrP    = riskP > 0 ? sd * (tp2P - entryP) / riskP : 0.0
+
+touched = sd == 1 ? low <= zTop : high >= zTop
+held    = sd == 1 ? close > zBot : close < zBot
+rejCandle = sd == 1 ? (close > open and (close - low) >= 0.5 * rng) : (close < open and (high - close) >= 0.5 * rng)
+patOk   = sd == 1 ? patBull : patBear
+rejOk   = not needRej or rejCandle or patOk
+
+htfOk   = not useHtf or (sd == 1 ? not htfBear : not htfBull)
+kzOk    = not useKz or inKz
+coolOk  = na(lastSig) or (bar_index - lastSig) > cooldown
+riskOk  = riskP >= atr * minRisk and riskP <= atr * maxRisk
+rrOk    = rrP >= minRR
+fvgOk   = not needFvg or fvgOv
+
+smcSig = conf and st == 2 and not newSt2 and touched and held and rejOk and htfOk and kzOk and coolOk and riskOk and rrOk and fvgOk
+
+// ════════════════════════════════════════════════════════════
+//  [MOM] MESIN MOMENTUM
+// ════════════════════════════════════════════════════════════
+ema21 = ta.ema(close, 21)
+ema50 = ta.ema(close, 50)
+hi5   = ta.highest(high, 5)[1]
+lo5   = ta.lowest(low, 5)[1]
+low4  = ta.lowest(low, 4)
+high4 = ta.highest(high, 4)
+low3  = ta.lowest(low, 3)
+high3 = ta.highest(high, 3)
+volAvg = ta.sma(volume, 20)
+volOkM = not useVol or volAvg == 0 or volume > volAvg * volMult
+
+closeFrac  = mode == "Agresif" ? 0.6 : 0.7
+strongBull = close > open and bd >= atr * momBody and (close - low) >= rng * closeFrac
+strongBear = close < open and bd >= atr * momBody and (high - close) >= rng * closeFrac
+notClimax  = rng <= atr * 3.5
+trendUp = mode == "Agresif" ? close > ema21 : (ema21 > ema50 and close > ema21)
+trendDn = mode == "Agresif" ? close < ema21 : (ema21 < ema50 and close < ema21)
+stretchUp = (close - ema21) / atr
+stretchDn = (ema21 - close) / atr
+trigL = close > hi5 or (low4 <= ema21 and close > high[1])
+trigS = close < lo5 or (high4 >= ema21 and close < low[1])
+mSlL = low3 - atr * momSlBuf
+mSlS = high3 + atr * momSlBuf
+mRiskL = close - mSlL
+mRiskS = mSlS - close
+htfOkL = not useHtf or not htfBear
+htfOkS = not useHtf or not htfBull
+
+// Tahapan filter (dipakai juga untuk diagnostik funnel)
+sL1 = strongBull and notClimax
+sL2 = sL1 and trendUp
+sL3 = sL2 and trigL
+sL4 = sL3 and stretchUp <= momStretch
+sL5 = sL4 and volOkM
+sL6 = sL5 and htfOkL and kzOk
+sL7 = sL6 and mRiskL >= atr * minRisk and mRiskL <= atr * momMaxRisk
+sS1 = strongBear and notClimax
+sS2 = sS1 and trendDn
+sS3 = sS2 and trigS
+sS4 = sS3 and stretchDn <= momStretch
+sS5 = sS4 and volOkM
+sS6 = sS5 and htfOkS and kzOk
+sS7 = sS6 and mRiskS >= atr * minRisk and mRiskS <= atr * momMaxRisk
+
+momLongOk = momOn and sL7
+momShortOk = momOn and sS7
+
+momLongSig = conf and not smcSig and coolOk and momLongOk
+momShortSig = conf and not smcSig and coolOk and momShortOk and not momLongOk
+
+// ───────────── FUNNEL DIAGNOSTIK (300 bar terakhir) ─────────────
+fW  = 300
+fn1 = math.sum(((sL1 or sS1) ? 1 : 0), fW)
+fn2 = math.sum(((sL2 or sS2) ? 1 : 0), fW)
+fn3 = math.sum(((sL3 or sS3) ? 1 : 0), fW)
+fn4 = math.sum(((sL4 or sS4) ? 1 : 0), fW)
+fn5 = math.sum(((sL5 or sS5) ? 1 : 0), fW)
+fn6 = math.sum(((sL6 or sS6) ? 1 : 0), fW)
+fn7 = math.sum(((sL7 or sS7) ? 1 : 0), fW)
+fnSig = math.sum(((momLongSig or momShortSig) ? 1 : 0), fW)
+fs1 = math.sum((newSweep ? 1 : 0), fW)
+fs2 = math.sum((newSt2 ? 1 : 0), fW)
+fs3 = math.sum((smcSig ? 1 : 0), fW)
+
+// ════════════════════════════════════════════════════════════
+//  SINYAL GABUNGAN
+// ════════════════════════════════════════════════════════════
+sigNow = smcSig or momLongSig or momShortSig
+gDir   = smcSig ? sd : momLongSig ? 1 : momShortSig ? -1 : 0
+gE     = close
+gSL    = smcSig ? slP : momLongSig ? mSlL : mSlS
+gRisk  = math.abs(gE - gSL)
+gT1    = smcSig ? tp1P : gE + gDir * gRisk * mr1
+gT2    = smcSig ? tp2P : gE + gDir * gRisk * mr2
+gT3    = smcSig ? tp3P : gE + gDir * gRisk * mr3
+gRR    = smcSig ? rrP : mr2
+gLim   = smcSig ? zMid : (high + low) / 2
+gTyp   = smcSig ? 0 : 1
+
+if newSweep
+    lastSweepTxt := (armDir == 1 ? "SSL " : "BSL ") + armTyp + " @ " + str.tostring(armLvl, format.mintick)
+
+if smcSig
+    st := 0
+    resetSt := true
+if sigNow
+    lastSig := bar_index
+    dayCount += 1
+
+// ════════════════════════════════════════════════════════════
+//  PELACAK HASIL: setiap sinyal dilacak sendiri (indeks 0 = SMC, 1 = MOM)
+// ════════════════════════════════════════════════════════════
+var array<int> aDir = array.new<int>()
+var array<int> aTyp = array.new<int>()
+var array<float> aE = array.new<float>()
+var array<float> aSL = array.new<float>()
+var array<float> aT1 = array.new<float>()
+var array<float> aT2 = array.new<float>()
+var array<float> aT3 = array.new<float>()
+var array<int> aStage = array.new<int>()
+var array<int> aBar = array.new<int>()
+
+var array<float> hN = array.new<float>(2, 0.0)
+var array<float> hTP1 = array.new<float>(2, 0.0)
+var array<float> hTP2 = array.new<float>(2, 0.0)
+var array<float> hTP3 = array.new<float>(2, 0.0)
+var array<float> hSL = array.new<float>(2, 0.0)
+var array<float> hBE = array.new<float>(2, 0.0)
+var array<float> hLock = array.new<float>(2, 0.0)
+var array<float> hR = array.new<float>(2, 0.0)
+var array<string> hist = array.new<string>()
+var int toCount = 0
+var int dispBar = na
+
+// Kejadian bar ini (untuk penanda chart & alert)
+float evTp1 = na
+float evTp2 = na
+float evTp3 = na
+float evSl = na
+float evBe = na
+float evLock = na
+bool dispClear = false
+
+if conf and array.size(aDir) > 0
+    for i = array.size(aDir) - 1 to 0
+        d = array.get(aDir, i)
+        ty = array.get(aTyp, i)
+        e = array.get(aE, i)
+        sl0 = array.get(aSL, i)
+        t1 = array.get(aT1, i)
+        t2 = array.get(aT2, i)
+        t3 = array.get(aT3, i)
+        stg = array.get(aStage, i)
+        rk = math.max(math.abs(e - sl0), 0.0001)
+        stopLv = stg == 0 ? sl0 : (useBE ? (stg == 1 ? e : t1) : sl0)
+        stopHit = d == 1 ? low <= stopLv : high >= stopLv
+        bool closed = false
+        string oc = ""
+        float rr = 0.0
+        if stopHit
+            closed := true
+            if stg == 0
+                rr := -1.0
+                oc := "SL✗"
+                evSl := stopLv
+                array.set(hSL, ty, array.get(hSL, ty) + 1.0)
+            else if useBE
+                if stg == 1
+                    rr := 0.0
+                    oc := "TP1✓(BE)"
+                    evBe := stopLv
+                    array.set(hBE, ty, array.get(hBE, ty) + 1.0)
+                else
+                    rr := d * (t1 - e) / rk
+                    oc := "TP2✓(kunci TP1)"
+                    evLock := stopLv
+                    array.set(hLock, ty, array.get(hLock, ty) + 1.0)
+            else
+                rr := -1.0
+                oc := "TP" + str.tostring(stg) + "✓ lalu SL"
+                evSl := stopLv
+                array.set(hSL, ty, array.get(hSL, ty) + 1.0)
+        else
+            if stg < 1 and (d == 1 ? high >= t1 : low <= t1)
+                stg := 1
+                evTp1 := t1
+                array.set(hTP1, ty, array.get(hTP1, ty) + 1.0)
+            if stg < 2 and (d == 1 ? high >= t2 : low <= t2)
+                stg := 2
+                evTp2 := t2
+                array.set(hTP2, ty, array.get(hTP2, ty) + 1.0)
+            if stg < 3 and (d == 1 ? high >= t3 : low <= t3)
+                stg := 3
+                evTp3 := t3
+                array.set(hTP3, ty, array.get(hTP3, ty) + 1.0)
+                closed := true
+                rr := d * (t3 - e) / rk
+                oc := "TP3✓"
+        if closed
+            array.set(hR, ty, array.get(hR, ty) + rr)
+            array.push(hist, (d == 1 ? "↑" : "↓") + (ty == 0 ? "S " : "M ") + oc)
+            if array.size(hist) > 5
+                array.shift(hist)
+        else if bar_index - array.get(aBar, i) > maxHold
+            closed := true
+            toCount += 1
+        if closed
+            if array.get(aBar, i) == dispBar
+                dispClear := true
+            array.remove(aDir, i)
+            array.remove(aTyp, i)
+            array.remove(aE, i)
+            array.remove(aSL, i)
+            array.remove(aT1, i)
+            array.remove(aT2, i)
+            array.remove(aT3, i)
+            array.remove(aStage, i)
+            array.remove(aBar, i)
+        else
+            array.set(aStage, i, stg)
+
+// Daftarkan sinyal baru (dilacak mulai candle berikutnya)
+if conf and sigNow
+    array.push(aDir, gDir)
+    array.push(aTyp, gTyp)
+    array.push(aE, gE)
+    array.push(aSL, gSL)
+    array.push(aT1, gT1)
+    array.push(aT2, gT2)
+    array.push(aT3, gT3)
+    array.push(aStage, 0)
+    array.push(aBar, bar_index)
+    array.set(hN, gTyp, array.get(hN, gTyp) + 1.0)
+    if array.size(aDir) > 40
+        array.remove(aDir, 0)
+        array.remove(aTyp, 0)
+        array.remove(aE, 0)
+        array.remove(aSL, 0)
+        array.remove(aT1, 0)
+        array.remove(aT2, 0)
+        array.remove(aT3, 0)
+        array.remove(aStage, 0)
+        array.remove(aBar, 0)
+        toCount += 1
+
+// ───────────── TANDA HASIL DI CHART ─────────────
+plotshape(showHits ? evTp1 : na, "TP1 tercapai", shape.labeldown, location.absolute, colBull, text="TP1 ✓", textcolor=color.white, size=size.tiny)
+plotshape(showHits ? evTp2 : na, "TP2 tercapai", shape.labeldown, location.absolute, colBull, text="TP2 ✓", textcolor=color.white, size=size.tiny)
+plotshape(showHits ? evTp3 : na, "TP3 tercapai", shape.labeldown, location.absolute, colBull, text="TP3 ✓", textcolor=color.white, size=size.tiny)
+plotshape(showHits ? evSl : na, "SL kena", shape.labelup, location.absolute, colBear, text="SL ✗", textcolor=color.white, size=size.tiny)
+plotshape(showHits ? evBe : na, "Stop di BE", shape.labelup, location.absolute, color.gray, text="BE", textcolor=color.white, size=size.tiny)
+plotshape(showHits ? evLock : na, "Stop di TP1 (terkunci)", shape.labelup, location.absolute, color.new(colBull, 40), text="T1 kunci", textcolor=color.white, size=size.tiny)
+
+// ───────────── PENANDA SETUP ─────────────
+plotshape(showSweep and newSweep and armDir == 1, "Sweep SSL", shape.diamond, location.belowbar, color.new(color.gray, 10), size=size.tiny)
+plotshape(showSweep and newSweep and armDir == -1, "Sweep BSL", shape.diamond, location.abovebar, color.new(color.gray, 10), size=size.tiny)
+plotshape(showPat and st == 2 and touched and sd == 1 and patBull, "Pola Bull di OTE", shape.triangleup, location.belowbar, color.new(colBull, 30), size=size.tiny)
+plotshape(showPat and st == 2 and touched and sd == -1 and patBear, "Pola Bear di OTE", shape.triangledown, location.abovebar, color.new(colBear, 30), size=size.tiny)
+
+// ───────────── GAMBAR ZONA OTE (hanya 1) ─────────────
+var box zBox = na
+if conf and resetSt and not na(zBox)
+    box.delete(zBox)
+    zBox := na
+if conf and newSt2
+    cz = sd == 1 ? colBull : colBear
+    zBox := box.new(bar_index, math.max(zTop, zBot), bar_index + 30, math.min(zTop, zBot), border_color=color.new(cz, 40), bgcolor=color.new(cz, 88), text="OTE", text_color=color.new(cz, 10), text_size=size.tiny)
+    if showStruct
+        line.new(sBar, sMss, bar_index, sMss, color=color.new(cz, 20), style=line.style_dotted, width=1)
+        label.new(bar_index, sMss, mssByCisd ? "CISD" : "MSS", style=label.style_none, textcolor=cz, size=size.tiny)
+else if conf and st == 2 and not na(zBox)
+    box.set_top(zBox, math.max(zTop, zBot))
+    box.set_bottom(zBox, math.min(zTop, zBot))
+    box.set_right(zBox, bar_index + 5)
+
+// ───────────── GAMBAR SETUP ENTRY TERBARU (hanya 1) ─────────────
+var array<line> sLines = array.new<line>()
+var array<label> sLabels = array.new<label>()
+var array<box> sBoxes = array.new<box>()
+
+var string lastTag = ""
+var int lastDir = 0
+var float lastE = na
+var float lastSL = na
+var float lastT1 = na
+var float lastT2 = na
+var float lastT3 = na
+var float lastLim = na
+var float lastPips = na
+
+// Setup yang ditampilkan sudah selesai (SL / BE / TP3 / timeout) -> hapus saran entry
+if conf and dispClear and not sigNow
+    while array.size(sLines) > 0
+        line.delete(array.pop(sLines))
+    while array.size(sLabels) > 0
+        label.delete(array.pop(sLabels))
+    while array.size(sBoxes) > 0
+        box.delete(array.pop(sBoxes))
+    lastDir := 0
+    dispBar := na
+
+if sigNow
+    while array.size(sLines) > 0
+        line.delete(array.pop(sLines))
+    while array.size(sLabels) > 0
+        label.delete(array.pop(sLabels))
+    while array.size(sBoxes) > 0
+        box.delete(array.pop(sBoxes))
+
+    extra = smcSig ? (fvgOv ? " +FVG" : "") + (patOk ? " +PTN" : "") : ""
+    tag = (gDir == 1 ? "BUY " : "SELL ") + (smcSig ? "SMC" : "MOM") + " RR " + str.tostring(gRR, "0.0") + extra
+    x2 = bar_index + 12
+    cMain = gDir == 1 ? colBull : colBear
+
+    label.new(bar_index, na, tag, yloc=gDir == 1 ? yloc.belowbar : yloc.abovebar, style=gDir == 1 ? label.style_label_up : label.style_label_down, color=cMain, textcolor=color.white, size=size.small)
+
+    array.push(sBoxes, box.new(bar_index, math.max(gE, gSL), x2, math.min(gE, gSL), border_color=na, bgcolor=color.new(colBear, 85)))
+    array.push(sBoxes, box.new(bar_index, math.max(gE, gT3), x2, math.min(gE, gT3), border_color=na, bgcolor=color.new(colBull, 88)))
+
+    array.push(sLines, line.new(bar_index, gE, x2, gE, color=color.new(color.white, 20), width=1))
+    array.push(sLines, line.new(bar_index, gLim, x2, gLim, color=color.new(color.white, 50), style=line.style_dashed, width=1))
+    array.push(sLines, line.new(bar_index, gSL, x2, gSL, color=colBear, style=line.style_dashed, width=1))
+    array.push(sLines, line.new(bar_index, gT1, x2, gT1, color=colBull, style=line.style_dotted, width=1))
+    array.push(sLines, line.new(bar_index, gT2, x2, gT2, color=colBull, style=line.style_dotted, width=1))
+    array.push(sLines, line.new(bar_index, gT3, x2, gT3, color=colBull, style=line.style_dotted, width=1))
+
+    array.push(sLabels, label.new(x2, gE, "ENTRY " + str.tostring(gE, format.mintick), style=label.style_label_left, color=cMain, textcolor=color.white, size=size.tiny))
+    array.push(sLabels, label.new(x2, gLim, "LIMIT " + str.tostring(gLim, format.mintick), style=label.style_label_left, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny))
+    array.push(sLabels, label.new(x2, gSL, "SL " + str.tostring(gSL, format.mintick), style=label.style_label_left, color=color.new(colBear, 25), textcolor=color.white, size=size.tiny))
+    array.push(sLabels, label.new(x2, gT1, "TP1 " + str.tostring(gT1, format.mintick), style=label.style_label_left, color=color.new(colBull, 25), textcolor=color.white, size=size.tiny))
+    array.push(sLabels, label.new(x2, gT2, "TP2 " + str.tostring(gT2, format.mintick), style=label.style_label_left, color=color.new(colBull, 25), textcolor=color.white, size=size.tiny))
+    array.push(sLabels, label.new(x2, gT3, "TP3 " + str.tostring(gT3, format.mintick), style=label.style_label_left, color=color.new(colBull, 25), textcolor=color.white, size=size.tiny))
+
+    lastTag := tag
+    dispBar := bar_index
+    lastDir := gDir
+    lastE := gE
+    lastSL := gSL
+    lastT1 := gT1
+    lastT2 := gT2
+    lastT3 := gT3
+    lastLim := gLim
+    lastPips := gRisk / pipSize
+
+// ───────────── DASHBOARD ─────────────
+tblPos = switch dashPos
+    "Top Left" => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left" => position.bottom_left
+    => position.top_right
+
+var table dash = table.new(tblPos, 2, 18, border_width=1, frame_color=color.new(color.gray, 70), frame_width=1)
+
+f_row(r, k, v, c) =>
+    table.cell(dash, 0, r, k, text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, v, text_color=color.white, bgcolor=color.new(c, 45), text_size=size.small)
+
+f_cnt(t) =>
+    lock = array.get(hLock, t)
+    str.tostring(array.get(hTP1, t), "0") + " / " + str.tostring(array.get(hTP2, t), "0") + " / " + str.tostring(array.get(hTP3, t), "0") + "  |  SL " + str.tostring(array.get(hSL, t), "0") + "  |  BE " + str.tostring(array.get(hBE, t), "0") + (lock > 0 ? "  |  Kunci " + str.tostring(lock, "0") : "") + "  |  n " + str.tostring(array.get(hN, t), "0")
+
+if showDash and barstate.islast
+    statusTxt = st == 0 ? "Menunggu sweep likuiditas" : st == 1 ? (sd == 1 ? "BUY: sweep SSL, tunggu MSS/CISD" : "SELL: sweep BSL, tunggu MSS/CISD") : (sd == 1 ? "BUY: tunggu retrace " : "SELL: tunggu retrace ") + str.tostring(zTop, format.mintick) + " - " + str.tostring(zBot, format.mintick)
+    blockTxt = st != 2 ? "-" : (not htfOk ? "HTF lawan  " : "") + (not kzOk ? "Luar killzone  " : "") + (not riskOk ? "Risiko tdk ideal  " : "") + (not rrOk ? "RR kecil  " : "") + (not fvgOk ? "Tanpa FVG  " : "") + (not coolOk ? "Cooldown  " : "")
+    blockShow = blockTxt == "" ? "Tidak ada" : blockTxt
+
+    dirM = strongBull ? 1 : strongBear ? -1 : 0
+    momTxt = (strongBull ? "Bullish kuat" : strongBear ? "Bearish kuat" : "Lemah / normal") + " | jarak EMA " + str.tostring((close - ema21) / atr, "0.0") + " ATR"
+    whyDir = dirM == 1 ? (not trendUp ? "EMA belum searah  " : "") + (stretchUp > momStretch ? "Terlalu jauh dari EMA  " : "") + (not trigL ? "Belum breakout/pullback  " : "") + (not htfOkL ? "HTF lawan  " : "") : (not trendDn ? "EMA belum searah  " : "") + (stretchDn > momStretch ? "Terlalu jauh dari EMA  " : "") + (not trigS ? "Belum breakout/pullback  " : "") + (not htfOkS ? "HTF lawan  " : "")
+    whyAll = whyDir + (not volOkM ? "Volume lemah  " : "") + (not coolOk ? "Cooldown  " : "") + (not notClimax ? "Candle climax  " : "") + (not kzOk ? "Luar killzone  " : "")
+    momWhy = not momOn ? "Momentum nonaktif" : dirM == 0 ? "-" : whyAll == "" ? "Lolos filter" : whyAll
+
+    sessTxt = inLon ? "London KZ" : inNy ? "New York KZ" : inAsia ? "Asia" : "Luar KZ"
+
+    nAll = array.get(hN, 0) + array.get(hN, 1)
+    tp1All = array.get(hTP1, 0) + array.get(hTP1, 1)
+    tp2All = array.get(hTP2, 0) + array.get(hTP2, 1)
+    tp3All = array.get(hTP3, 0) + array.get(hTP3, 1)
+    slAll = array.get(hSL, 0) + array.get(hSL, 1)
+    netS = array.get(hR, 0)
+    netM = array.get(hR, 1)
+    openN = array.size(aDir)
+
+    string histTxt = ""
+    if array.size(hist) > 0
+        for i = array.size(hist) - 1 to 0
+            histTxt += array.get(hist, i) + "   "
+    histShow = histTxt == "" ? "-" : histTxt
+
+    int r = 0
+    f_row(r, "SMC", statusTxt + (tfOk ? "" : "  (pakai 3/5/15m)"), st == 0 ? color.gray : sd == 1 ? colBull : colBear)
+    r += 1
+    f_row(r, "Momentum", momTxt, strongBull ? colBull : strongBear ? colBear : color.gray)
+    r += 1
+    if dashFull
+        f_row(r, "SMC penghambat", blockShow, st == 2 and blockTxt != "" ? color.orange : color.gray)
+        r += 1
+        f_row(r, "MOM penghambat", momWhy, dirM != 0 and whyAll != "" ? color.orange : color.gray)
+        r += 1
+        f_row(r, "Bias HTF " + htf, htfBull ? "Bullish" : htfBear ? "Bearish" : "Netral", htfBull ? colBull : htfBear ? colBear : color.gray)
+        r += 1
+        f_row(r, "Sesi / Struktur", sessTxt + " / " + (trend == 1 ? "Bullish" : trend == -1 ? "Bearish" : "-"), inKz ? color.blue : color.gray)
+        r += 1
+        f_row(r, "Sweep terakhir", lastSweepTxt, color.gray)
+        r += 1
+    f_row(r, "Entry", lastDir == 0 ? "Tunggu setup" : lastTag + " " + str.tostring(lastE, format.mintick) + " | Limit " + str.tostring(lastLim, format.mintick), lastDir == 1 ? colBull : lastDir == -1 ? colBear : color.gray)
+    r += 1
+    f_row(r, "SL", lastDir == 0 ? "-" : str.tostring(lastSL, format.mintick) + " (" + str.tostring(lastPips, "0.0") + " pips)", color.gray)
+    r += 1
+    f_row(r, "TP1 / TP2 / TP3", lastDir == 0 ? "-" : str.tostring(lastT1, format.mintick) + " / " + str.tostring(lastT2, format.mintick) + " / " + str.tostring(lastT3, format.mintick), color.gray)
+    r += 1
+    f_row(r, "Sinyal", "hari ini " + str.tostring(dayCount) + "  |  total " + str.tostring(nAll, "0") + "  |  berjalan " + str.tostring(openN) + (toCount > 0 ? "  |  timeout " + str.tostring(toCount) : ""), color.blue)
+    r += 1
+    f_row(r, "Funnel MOM (300 bar)", "kuat " + str.tostring(fn1, "0") + " > tren " + str.tostring(fn2, "0") + " > trigger " + str.tostring(fn3, "0") + " > jarak " + str.tostring(fn4, "0") + " > volume " + str.tostring(fn5, "0") + " > HTF/KZ " + str.tostring(fn6, "0") + " > risiko " + str.tostring(fn7, "0") + "  |  sinyal " + str.tostring(fnSig, "0"), fnSig > 0 ? colBull : color.orange)
+    r += 1
+    f_row(r, "Funnel SMC (300 bar)", "sweep " + str.tostring(fs1, "0") + " > MSS " + str.tostring(fs2, "0") + " > entry " + str.tostring(fs3, "0"), fs3 > 0 ? colBull : color.gray)
+    r += 1
+    f_row(r, "SMC  TP1/TP2/TP3", f_cnt(0), array.get(hN, 0) == 0 ? color.gray : netS > 0 ? colBull : colBear)
+    r += 1
+    f_row(r, "MOM  TP1/TP2/TP3", f_cnt(1), array.get(hN, 1) == 0 ? color.gray : netM > 0 ? colBull : colBear)
+    r += 1
+    f_row(r, "Persentase", nAll == 0 ? "-" : "TP1 " + str.tostring(tp1All * 100.0 / nAll, "0") + "%  |  TP2 " + str.tostring(tp2All * 100.0 / nAll, "0") + "%  |  TP3 " + str.tostring(tp3All * 100.0 / nAll, "0") + "%  |  SL " + str.tostring(slAll * 100.0 / nAll, "0") + "%", color.gray)
+    r += 1
+    f_row(r, "Net R (trailing)", "SMC " + str.tostring(netS, "0.0") + "R  |  MOM " + str.tostring(netM, "0.0") + "R  |  total " + str.tostring(netS + netM, "0.0") + "R", netS + netM > 0 ? colBull : netS + netM < 0 ? colBear : color.gray)
+    r += 1
+    f_row(r, "Riwayat terakhir", histShow, color.gray)
+
+// ───────────── ALERT ─────────────
+alertcondition(sigNow and gDir == 1, "XAU BUY", "XAU: BUY {{ticker}} @ {{close}} ({{interval}})")
+alertcondition(sigNow and gDir == -1, "XAU SELL", "XAU: SELL {{ticker}} @ {{close}} ({{interval}})")
+alertcondition(not na(evTp1), "TP1 tercapai", "XAU: TP1 tercapai {{ticker}} ({{interval}})")
+alertcondition(not na(evTp2), "TP2 tercapai", "XAU: TP2 tercapai {{ticker}} ({{interval}})")
+alertcondition(not na(evTp3), "TP3 tercapai", "XAU: TP3 tercapai {{ticker}} ({{interval}})")
+alertcondition(not na(evSl), "SL kena", "XAU: SL kena {{ticker}} ({{interval}})")
+alertcondition(newSweep, "Sweep terdeteksi", "Sweep likuiditas {{ticker}} ({{interval}})")
+alertcondition(newSt2, "MSS terkonfirmasi", "MSS/CISD terkonfirmasi {{ticker}} ({{interval}}) - tunggu retrace ke OTE")
